@@ -20,4 +20,5 @@ if (-not (Test-Path ".env")) {
 }
 
 Write-Host "Servidor en http://localhost:8000  (docs: /docs)" -ForegroundColor Green
-& $python -m uvicorn app.main:app --reload --port 8000
+Write-Host "Se reinicia solo al editar .env o cualquier archivo .py" -ForegroundColor DarkGray
+& $python -m uvicorn app.main:app --reload --reload-include ".env" --port 8000

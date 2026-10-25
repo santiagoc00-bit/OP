@@ -45,6 +45,8 @@ class Settings(BaseSettings):
     gemini_temperature: float = 0.5
     gemini_max_output_tokens: int = 600
     gemini_thinking_budget: int | None = 0
+    # Si el modelo configurado deja de existir, se intenta este antes de rendirse.
+    gemini_fallback_model: str = "gemini-flash-latest"
 
     # ---------- Comportamiento ----------
     business_name: str = "Mi Negocio"

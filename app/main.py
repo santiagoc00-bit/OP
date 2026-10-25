@@ -94,6 +94,7 @@ def get_agent() -> SupportAgent:
             max_output_tokens=settings.gemini_max_output_tokens,
             thinking_budget=settings.gemini_thinking_budget,
             timezone=settings.timezone,
+            fallback_model=settings.gemini_fallback_model,
         )
     return _agent
 
@@ -148,7 +149,11 @@ async def lifespan(app: FastAPI):
     elif "telegram" in channels:
         log.info("Telegram en modo webhook: POST /telegram/webhook")
 
-    log.info("Asistente listo. Negocio: %s", settings.business_name)
+    log.info(
+        "Asistente listo. Negocio: %s | modelo: %s",
+        settings.business_name,
+        settings.gemini_model,
+    )
     yield
 
     if _poll_task is not None:

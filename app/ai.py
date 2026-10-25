@@ -129,6 +129,7 @@ class SupportAgent:
         max_output_tokens: int = 600,
         thinking_budget: int | None = 0,
         timezone: str = "America/Mexico_City",
+        fallback_model: str | None = "gemini-flash-latest",
     ) -> None:
         self._api_key = api_key
         self._model = model
@@ -136,6 +137,7 @@ class SupportAgent:
         self._max_output_tokens = max_output_tokens
         self._thinking_budget = thinking_budget
         self._timezone = timezone
+        self._fallback_model = fallback_model
         self._client: genai.Client | None = None
 
     @property
@@ -157,19 +159,85 @@ class SupportAgent:
         if not contents:
             return SupportAnswer(reply="¿En qué te puedo ayudar?", handoff=False)
 
-        config = self._build_config(business_name, knowledge)
-
         try:
-            response = await self.client.aio.models.generate_content(
-                model=self._model, contents=contents, config=config
-            )
-        except Exception:
-            log.exception("Error llamando a Gemini")
+            response = await self._generate(contents, business_name, knowledge)
+        except Exception as exc:
+            log.error("Gemini fallo (modelo '%s'): %s: %s", self._model, type(exc).__name__, exc)
+            log.debug("Detalle del error de Gemini", exc_info=True)
+            if self._is_missing_model(exc):
+                log.error(
+                    "Ese modelo no existe o no esta disponible para tu clave. "
+                    "Ejecuta check.cmd o cambia GEMINI_MODEL en .env."
+                )
             return SupportAnswer(
-                reply=FALLBACK_REPLY, handoff=True, handoff_reason="error de la IA"
+                reply=FALLBACK_REPLY,
+                handoff=True,
+                handoff_reason=f"error de la IA ({type(exc).__name__})",
             )
 
         return self._parse(response)
+
+    async def _generate(
+        self, contents: list[types.Content], business_name: str, knowledge: str
+    ) -> Any:
+        """Llama a Gemini probando configuraciones cada vez más simples.
+
+        No todos los modelos aceptan `response_schema` o `thinking_budget`, y una
+        respuesta vacía tampoco sirve. En vez de fallar, se degrada:
+          1. JSON estructurado (lo ideal)
+          2. JSON estructurado sin "thinking"
+          3. Texto plano pidiendo JSON en el prompt
+        """
+        configs = self._configs(business_name, knowledge)
+
+        try:
+            return await self._try_configs(self._model, contents, configs)
+        except Exception as exc:
+            fallback = self._fallback_model
+            if (
+                not fallback
+                or fallback == self._model
+                or not self._is_missing_model(exc)
+            ):
+                raise
+            log.warning(
+                "El modelo '%s' no esta disponible; probando con '%s'. "
+                "Actualiza GEMINI_MODEL en .env.",
+                self._model,
+                fallback,
+            )
+            return await self._try_configs(fallback, contents, configs)
+
+    async def _try_configs(
+        self,
+        model: str,
+        contents: list[types.Content],
+        configs: list[types.GenerateContentConfig],
+    ) -> Any:
+        last_error: Exception | None = None
+        for index, config in enumerate(configs, start=1):
+            try:
+                return await self.client.aio.models.generate_content(
+                    model=model, contents=contents, config=config
+                )
+            except Exception as exc:
+                last_error = exc
+                if index < len(configs):
+                    log.warning(
+                        "Gemini rechazo la configuracion %s/%s (%s: %s). "
+                        "Reintentando de forma mas simple.",
+                        index,
+                        len(configs),
+                        type(exc).__name__,
+                        str(exc)[:200],
+                    )
+        assert last_error is not None
+        raise last_error
+
+    @staticmethod
+    def _is_missing_model(exc: Exception) -> bool:
+        text = str(exc).upper()
+        return "NOT_FOUND" in text or "404" in text
 
     # ------------------------------------------------------------------ #
     @staticmethod
@@ -187,27 +255,48 @@ class SupportAgent:
                 contents.append(types.Content(role=role, parts=[types.Part(text=text)]))
         return contents
 
-    def _build_config(self, business_name: str, knowledge: str) -> types.GenerateContentConfig:
-        kwargs: dict[str, Any] = {
-            "system_instruction": build_system_prompt(
-                business_name, knowledge, human_datetime(self._timezone)
-            ),
+    def _configs(self, business_name: str, knowledge: str) -> list[types.GenerateContentConfig]:
+        """Configuraciones ordenadas de más a menos estricta."""
+        system = build_system_prompt(
+            business_name, knowledge, human_datetime(self._timezone)
+        )
+        base: dict[str, Any] = {
+            "system_instruction": system,
             "temperature": self._temperature,
             "max_output_tokens": self._max_output_tokens,
+        }
+        structured: dict[str, Any] = {
+            **base,
             "response_mime_type": "application/json",
             "response_schema": SupportAnswer,
         }
 
-        thinking_config = getattr(types, "ThinkingConfig", None)
-        if self._thinking_budget is not None and thinking_config is not None:
+        configs: list[types.GenerateContentConfig] = []
+
+        thinking_cls = getattr(types, "ThinkingConfig", None)
+        if self._thinking_budget is not None and thinking_cls is not None:
             try:
-                kwargs["thinking_config"] = thinking_config(
-                    thinking_budget=self._thinking_budget
-                )
+                thinking = thinking_cls(thinking_budget=self._thinking_budget)
             except Exception:  # versión del SDK sin soporte
                 log.debug("ThinkingConfig no soportado por esta versión del SDK")
+            else:
+                configs.append(
+                    types.GenerateContentConfig(**structured, thinking_config=thinking)
+                )
 
-        return types.GenerateContentConfig(**kwargs)
+        configs.append(types.GenerateContentConfig(**structured))
+
+        # Último recurso: texto plano pidiendo el JSON dentro del prompt.
+        plain = dict(base)
+        plain["system_instruction"] = (
+            system
+            + "\n\nFORMATO OBLIGATORIO DE SALIDA: responde ÚNICAMENTE con un objeto JSON "
+            'con las claves "reply" (texto para el cliente), "handoff" (true o false) '
+            'y "handoff_reason" (texto o null). Sin markdown ni explicaciones.'
+        )
+        configs.append(types.GenerateContentConfig(**plain))
+
+        return configs
 
     @staticmethod
     def _parse(response: Any) -> SupportAnswer:

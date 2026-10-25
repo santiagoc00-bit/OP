@@ -399,3 +399,80 @@ def test_polling_entrega_updates(temp_db) -> None:
 
     asyncio.run(poll_updates(stop, FakeTelegram(), handler))
     assert recibidos == ["Hola"]
+
+
+# --------------------------------------------------------------------------- #
+# Resiliencia del agente
+# --------------------------------------------------------------------------- #
+class _FakeModels:
+    def __init__(self, fail_first: int = 0, missing_models: set[str] | None = None) -> None:
+        self.calls: list[tuple[str, object]] = []
+        self.fail_first = fail_first
+        self.missing_models = missing_models or set()
+
+    async def generate_content(self, *, model, contents, config):
+        from app.ai import SupportAnswer
+
+        self.calls.append((model, config))
+        if model in self.missing_models:
+            raise RuntimeError("404 NOT_FOUND: model is not found")
+        if len(self.calls) <= self.fail_first:
+            raise RuntimeError("400 INVALID_ARGUMENT: response_schema not supported")
+
+        class Response:
+            parsed = SupportAnswer(reply="Hola", handoff=False, handoff_reason=None)
+            text = '{"reply": "Hola", "handoff": false, "handoff_reason": null}'
+
+        return Response()
+
+
+class _FakeClient:
+    def __init__(self, models: _FakeModels) -> None:
+        self.aio = type("Aio", (), {"models": models})()
+
+
+def _agent_with(models: _FakeModels, **kwargs):
+    from app.ai import SupportAgent
+
+    agent = SupportAgent(api_key="x", model="modelo-principal", **kwargs)
+    agent._client = _FakeClient(models)  # type: ignore[assignment]
+    return agent
+
+
+def test_degrada_si_el_modelo_rechaza_el_schema() -> None:
+    """Si la salida estructurada falla, se reintenta con una configuración más simple."""
+    models = _FakeModels(fail_first=1)
+    agent = _agent_with(models, thinking_budget=0)
+
+    answer = asyncio.run(
+        agent.answer(history=[{"role": "user", "content": "hola"}], knowledge="", business_name="N")
+    )
+
+    assert answer.reply == "Hola"
+    assert answer.handoff is False
+    assert len(models.calls) == 2
+
+
+def test_usa_modelo_de_respaldo_si_el_principal_no_existe() -> None:
+    models = _FakeModels(missing_models={"modelo-principal"})
+    agent = _agent_with(models, fallback_model="modelo-respaldo")
+
+    answer = asyncio.run(
+        agent.answer(history=[{"role": "user", "content": "hola"}], knowledge="", business_name="N")
+    )
+
+    assert answer.reply == "Hola"
+    assert models.calls[-1][0] == "modelo-respaldo"
+
+
+def test_configuraciones_de_mas_a_menos_estricta() -> None:
+    agent = _agent_with(_FakeModels(), thinking_budget=0)
+    configs = agent._configs("Negocio", "info")
+    assert len(configs) == 3
+    assert configs[0].response_schema is not None
+    assert configs[0].thinking_config is not None
+    assert configs[1].thinking_config is None
+    assert configs[2].response_schema is None
+
+    agent_sin_thinking = _agent_with(_FakeModels(), thinking_budget=None)
+    assert len(agent_sin_thinking._configs("Negocio", "info")) == 2

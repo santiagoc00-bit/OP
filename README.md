@@ -50,8 +50,12 @@ ADMIN_KEY=una-clave-larga
 ### 3. Arrancar
 
 ```powershell
-.\run.ps1
+.\run.cmd
 ```
+
+> Si PowerShell te bloquea `run.ps1` ("running scripts is disabled on this
+> system"), usa `run.cmd`, que no depende de la política de ejecución. Como
+> alternativa puntual: `powershell -ExecutionPolicy Bypass -File .\run.ps1`.
 
 En el log verás:
 
@@ -218,10 +222,39 @@ Sirve para un canal de Slack/Telegram/Make/n8n y que el equipo se entere al mome
 
 ---
 
+## Si el bot responde "estoy teniendo un problema técnico"
+
+Ese texto significa que el mensaje **sí llegó** y el bot intentó contestar, pero la
+llamada a Gemini falló. Ejecuta:
+
+```powershell
+.\check.cmd
+```
+
+El diagnóstico prueba la configuración, el token de Telegram, la clave de Gemini y
+te dice qué modelo puedes usar. Interpretación:
+
+| Salida | Qué hacer |
+|---|---|
+| `[FALLA] El token de Telegram no funciona` | Regenera el token en @BotFather y actualiza `.env` |
+| `[FALLA] No se pudieron listar los modelos` | La clave de Gemini es inválida o de otro proyecto |
+| `[AVISO] 'gemini-2.5-flash' no está en la lista` | Modelo retirado: copia uno de la lista a `GEMINI_MODEL` |
+| `[AVISO] Sigue siendo el ejemplo de la cafetería` | Edita `knowledge/negocio.md` |
+
+La terminal donde corre `run.cmd` también muestra la causa exacta en una línea
+`Gemini fallo (modelo '...'): ...`.
+
+> Un `GET /v1/models 404` en el log **no** viene de este proyecto: es otro programa
+> llamando a nuestro puerto. El bot habla con Gemini por HTTPS, no con ese endpoint.
+
+> `run.cmd` vigila también el `.env`: al guardarlo, el servidor se reinicia solo y
+> toma los valores nuevos. Si arrancaste `uvicorn` a mano sin
+> `--reload-include ".env"`, reinícialo tras cambiar credenciales.
+
 ## Tests
 
 ```powershell
-.\\.venv\\Scripts\\python.exe -m pytest
+.\.venv\Scripts\python.exe -m pytest
 ```
 
 Cubren firma HMAC, verificación del webhook de WhatsApp, secreto del webhook de
